@@ -1,0 +1,351 @@
+---
+title: "Итоговый проект"
+author: "Группа N 14" 
+output: 
+  html_document:
+    code_folding: hide
+---
+
+### Предобработка 
+
+На этапе предобработки данных был проведён текстовый анализ с помощью LDA. Целью текстового анализа являлось посмотреть, как фильмы разбиты по темам. Также была получена информация, какие примерно это темы. Загрузим необходимые библиотеки и датасеты, с которыми будем работать:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Загрузка данных и библиотек
+library(tidyverse)
+library(tidyr)
+library(recommenderlab)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(LDAvis) 
+library(topicmodels) 
+library(stringr)
+library (tidytext)
+
+load("~/shared/minor2_2022/data/project/metadata_g_4.RData")
+load("~/shared/minor2_2022/data/project/ratings_g_4.RData")
+```
+
+Построим таблицу, необходимую для LDA анализа. Сначала соединим датасет с названиями тегов и с отзывами на фильмы. Для каждого фильма вычислим среднюю оценку уверенности по тегам. Если средняя оценка уверенности < 3.0, то будем считать, что тег фильму не подходит.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+colnames(tags) = c("tag", "tag_id") #Переименовываем колонки
+tags_full = left_join(survey_answers, tags) %>%
+  select(-user_id)
+  #Соединяем датасеты и убираем колонку с данными о пользователе
+
+
+tags_full = tags_full %>% 
+  group_by(item_id, tag) %>% 
+  summarise(mean_conf = mean(score)) %>%
+  filter(mean_conf > 3.0) #Берём среднее по всем уверенностям и отфильтровываем
+
+```
+
+Получаем таблицу с информацией, какому фильму соответствуют какие теги. Теперь можно строить модель LDA:
+
+``` {r message=FALSE, warning=FALSE, paged.print=FALSE}
+tags_dtm <- tags_full %>% 
+  count(item_id, tag) %>% 
+  cast_dtm(item_id,tag, n)
+
+tags_lda <- LDA(tags_dtm, k = 8, control = list(seed = 12345))
+
+
+```
+
+Попробуем примерно представить, какие темы мы получили. Получим из модели таблицу с вероятностями того, что слово относится к той или иной теме. За эту вероятность отвечает коэффициент beta.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+tags_topics <- tidy(tags_lda, matrix = "beta")
+
+
+```
+
+Посмотрим на самые популярные слова в каждой из тем.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+tags_top_terms <- tags_topics %>%
+  group_by(topic) %>%
+  top_n(7, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) #отбираем топ 7 слов с наибольшими вероятностями попасть в тему (слов может быть больше 7, так как некоторые вероятности совпадают)
+
+#Строим график
+tags_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Распределение тегов для фильмов на темы", x = "Слова" , y = "Вероятность попадания в тему") +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  theme_test() #Убираем сетку на заднем плане
+
+```
+
+По этим ключевым словам можно примерно догадаться, о чём каждая из выделенных тем. Теперь посмотрим на принадлежность фильма к той или иной теме. Получим из модели gamma -- коэффициент, который обозначает вероятность того, что фильм относится к теме.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+films_topics = tidy(tags_lda, matrix = "gamma")
+films_topics
+
+```
+
+Будем считать, что фильм принадлежит теме, если вероятность для него попасть в эту тему > 0.45. Получаем таблицу, в которой указано, каким темам принадлежит фильм.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+films_themes = films_topics %>% filter(gamma > 0.45) %>% select(-gamma) #отфильтровываем и убираем gamma
+colnames(films_themes) = c("item_id", "topic")
+films_themes = films_topics %>% filter(gamma > 0.45) 
+colnames(films_themes) = c("item_id", "topic","gamma")
+films_themes$item_id = as.numeric(films_themes$item_id)
+
+```
+
+Получили таблицу, которая указывает, к какой теме (или темам) относится каждый фильм. Далее эта таблица была использована при построении одной из рекомендательных систем.
+
+Также в предобработке данных для построения content-based рекомендательной системы было принято отфильтровать теги по уверенности пользователя в нем. Если уверенность низкая, то тег для фильма убирался 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Фильтруем теги по уверенности пользователя в них. Оценка тега<3-убираем
+colnames(tags) = c("tag", "tag_id")
+tags_full = inner_join(tags, survey_answers)
+tags_full = tags_full %>% 
+  group_by(item_id, tag) %>% 
+  summarise(mean_confident = mean(score)) %>% 
+  filter(mean_confident >= 3.0)
+```
+
+
+### Коллаборативная фильтрация
+
+Будем использовать способ IBCF (Item-Based Collaborative Filtering), так как он лучше подходит для построения рекомендательной системы в данном случае по следующим причинам: учитывает сходство между фильмами, позволяет рекомендовать фильмы на основе схожих элементов. IBCF предоставляет персонализированные рекомендации, учитывая предпочтения пользователей.(В конце приведена оценка, доказывающая, что метод IBCF в данном случае оправдан)
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+rates = pivot_wider(ratings, names_from = item_id, values_from = rating) #Преобразуем к таблице в "широком" формате, чтобы все работало с recommendlab
+userNames = rates$user_id #Для дальнейшей работы в данных должны остаться только оценки, никаких дополнительных характеристик, поэтому сохраним id пользователей и удалим столбец с id пользователей
+rates = select(rates, -user_id) 
+rates = as.matrix(rates)
+rownames(rates) = userNames #добавляем конкретные айди, чтобы потом не искать
+ra_movie_matrix = as(rates, "realRatingMatrix") 
+```
+В данном случае таблица "Rating frequency" показывает, сколько раз каждое значение рейтинга встречается в наших данных (в исходной матрице рейтингов ra_movie_matrix). Это помогает нам увидеть, какие рейтинги более популярны (или непопулярны) среди пользователей. Гистограмма рейтингов представляет эти данные в виде столбцов, чтобы мы могли визуально оценить, какие значения рейтинга наиболее часто встречаются. Например, если таблица показывает, что рейтинг 4 (высокое предпочтение) имеет наибольшее количество оценок, это может указывать на то, что большинство пользователей предпочитают фильмы с высоким рейтингом - как раз, как в нашем случае.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+similarity_films10 <- similarity(ra_movie_matrix, method = "cosine", which = "items")
+#Количество оценок, соответствующих каждому значению оценки, показано ниже
+vector_ratings <- as.vector(ra_movie_matrix@data)
+kable(table(vector_ratings), caption="Rating frequency")
+vector_ratings = vector_ratings[vector_ratings != 0] #Поскольку рейтинг со значением 0 означает отсутствие рейтинга, мы удаляем такие рейтинги из вектора рейтингов
+hist(vector_ratings, main="Histogram of Ratings", xlab="Rating Value") #Выше мы видим, что рейтинг 4 (указывающий на высокое предпочтение) является наиболее распространенным рейтингом, и что значения рейтинга смещены влево.
+```
+Для построения модели коллаборативной фильтрации мы можем ограничить входные данные на основе минимальных порогов. Здесь мы ограничиваем обучение модели теми пользователями, которые оценили не менее 10 фильмов, и теми фильмами, которые оценили не менее 35 пользователей.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+
+ggplot(data = data.frame(filmRate=colCounts(ra_movie_matrix))) + geom_histogram(aes(x=filmRate))
+ggplot(data = data.frame(userRate=rowCounts(ra_movie_matrix))) + geom_histogram(aes(x=userRate))
+ratings_new = ra_movie_matrix[rowCounts(ra_movie_matrix) > 10, colCounts(ra_movie_matrix) > 35] #подбор значений исходя из графиков, построенных выше 
+```
+Разделим данные на тестовую и обучающую выборки. На обучающей построим модель, т.е. зададим общие принципы рекомендации, для пользователей из тестовой будем рекомендовать фильмы. Для правильной оценки разделим данные на тестовую и обучающую выборки.
+```{r message = FALSE, warning = FALSE, echo = F}
+set.seed(100)
+sets = evaluationScheme(data = ratings_new, 
+                              method = "split",
+                              train = 0.8, 
+                              given = 35,
+                              goodRating = 3.5) 
+#Строим модель на обучающей, предсказываем на тестовой
+recc_model <-
+  Recommender(data = getData(sets, "train"), method = "IBCF")
+recc_predicted <-
+  predict(
+    object = recc_model,
+    newdata = getData(sets, "known"),
+    n = 6,
+    type = "ratings"
+  )
+```
+Для работы функции пользователю необходимо знать свой ID. Тогда он получит рекомендацию из 6 фильмов.
+Если пользоватеть новый, ему будет предложена рекомендация из 10 наиболее популярных фильмов.
+В следующем чанке представлена функция для CF 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+recc_model = Recommender(data = ratings_new, method = "IBCF") #предварительное построение модели
+cf_recommendation = function(user_id) {
+  recc_predicted = predict(object = recc_model, newdata = ratings_new, n = 6)
+
+  names(recc_predicted@items) = rownames(ratings_new)
+  recc_user_1 = recc_predicted@items[[user_id]]
+  movies_user_1 = recc_predicted@itemLabels[recc_user_1]
+  names_movies_user_1 = metadata$title[match(movies_user_1, metadata$item_id)]
+  
+  if (length(names_movies_user_1)==0L) {
+  new_var=metadata %>% select(item_id,title) %>% left_join(ratings) %>% select(-item_id,-user_id) %>%       group_by(title,rating) %>% count(rating) %>% ungroup()
+  good_rating=new_var %>% filter(rating>=3.5) %>%  select(-rating) %>%  group_by(title) %>% summarise(sum_good=sum(n))
+  bad_rating=new_var %>% filter(rating<3.5) %>%  select(-rating) %>%  group_by(title) %>% summarise(sum_bad=sum(n))
+  new_rating = good_rating %>% left_join(bad_rating)
+  new_rating=new_rating %>% mutate(absolute_value=(sum_good-sum_bad)/(sum_good+sum_bad)) %>% arrange(-absolute_value)
+  answer=new_rating[1:10,] %>% select(title)
+  answer
+  } else {
+    names_movies_user_1
+  }
+}
+```
+
+**Оценивание рекомендации:**
+для IBCF метода:
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+model_IBCF = Recommender(data = getData(sets, "train"), method = "IBCF")
+predicted_IBCF = predict(object = model_IBCF, newdata = getData(sets, "known"), type = "ratings")
+
+accuracy_IBCF = calcPredictionAccuracy(x = predicted_IBCF,
+                                        data = getData(sets, "unknown"),
+                                        byUser = F) 
+accuracy_IBCF
+```
+для метода UBCF:
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+model_UBCF = Recommender(data = getData(sets, "train"), method = "UBCF", parameter = list(nn = 6))
+predicted_UBCF = predict(object = model_UBCF, newdata = getData(sets, "known"), type = "ratings")
+
+accuracy_UBCF = calcPredictionAccuracy(x = predicted_UBCF,
+                                         data = getData(sets, "unknown"),
+                                         byUser = F) 
+accuracy_UBCF
+```
+Действительно, в методе IBCF показатель MAE и другие ниже, то есть рекомендации качественнее. Мы сделали верный выбор. 
+
+
+### Content-based рекомендация
+
+Использовались переменные: item_id, title (выводились названия фильмов), tag, score(в предобработке). Также была добавлена переменная, которая считала для каждого фильма средний рейтинг по пользователю. Также стоит уточнить, что в связи с отсечением определенных тегов, кол-во фильмов сильно сократилось. 
+```{r message=FALSE, warning=FALSE}
+# Считаю среднюю оценку фильмов по пользователю (avgRating-это рейтинг не пользователей, а MovieLens)
+average_value=ratings %>% group_by(item_id) %>% summarize(rating = mean(rating, na.rm = T)) 
+```
+Создаю копию metadata
+```{r message=FALSE, warning=FALSE}
+
+metadata1=metadata %>% select(item_id)
+```
+Объединяю и преобразовываю таблицу так, чтобы в столбцах были теги (1-тег для фильма есть, 0-отсутствует)
+```{r message=FALSE, warning=FALSE}
+
+merged_data = inner_join(metadata1, tags_full, by = "item_id")  %>% select(-mean_confident)
+merged_data=inner_join(merged_data, average_value) %>% mutate(tags_v=1)
+merged_data=merged_data %>% pivot_wider(names_from = "tag", values_from = "tags_v", values_fill=0)
+
+```
+Смотрим схожесть
+```{r message=FALSE, warning=FALSE}
+
+rownames=merged_data$item_id
+merged_data = merged_data %>% dplyr::select(-item_id)
+rownames(merged_data) = rownames
+sim = lsa::cosine(t(as.matrix(merged_data)))
+diag(sim) = 0
+
+```
+Код с функцией для СВ:
+
+```{r message=FALSE, warning=FALSE}
+recommendations = function(id){
+  user = ratings %>% filter(user_id == id & rating == 5)
+  if (nrow(user)==0) {
+    new_var=metadata %>% select(item_id,title) %>% left_join(ratings) %>% select(-item_id,-user_id) %>%       group_by(title,rating) %>% count(rating) %>% ungroup()
+  good_rating=new_var %>% filter(rating>=3.5) %>%  select(-rating) %>%  group_by(title) %>% summarise(sum_good=sum(n))
+  bad_rating=new_var %>% filter(rating<3.5) %>%  select(-rating) %>%  group_by(title) %>% summarise(sum_bad=sum(n))
+  new_rating = good_rating %>% left_join(bad_rating)
+  new_rating=new_rating %>% mutate(absolute_value=(sum_good-sum_bad)/(sum_good+sum_bad)) %>% arrange(-absolute_value)
+  answer=new_rating[1:5,] %>% select(title)
+  answer
+} else {
+  ifelse(test = nrow(user) == 0, (user = ratings %>% filter(user_id == id & rating == 4)),       user)
+    mostSimilar = head(sort(sim[,as.character(user$item_id)], decreasing = T), n = 5)
+    a = which(sim[,as.character(user$item_id)] %in% mostSimilar, arr.ind = TRUE)
+    index = arrayInd(a, .dim = dim(sim[,as.character(user$item_id)]))
+    result = rownames(sim)[index[,1]]
+    recommend = filter(metadata,item_id %in% result) %>% dplyr::select(title)
+  
+  recommend
+}
+}
+```
+
+**Оценивание рекомендации:** Оценивание результатов проводилось тестированием функции для различных пользователей
+
+
+### Примеры
+
+
+##### Примеры collaborative filtering
+Для коллаборативной фильтрации не было предложено сценариев, поэтому мы привели пример и оценку системы для рандомно выбранного пользователя.
+
+```{r message=FALSE, warning=FALSE}
+films_by_tags = inner_join(tags_full, metadata) %>% 
+  select(c("tag", "mean_confident", "title", "avgRating"))
+
+#посмотрим на среднюю оценку пользователей и объединим с датасетом
+films_by_rating = ratings%>% group_by(user_id)
+films_full = films_by_tags %>% inner_join(films_by_rating)
+#Посмотрим, какие фильмы оценил пользователь на оценку выше 3
+random_id = films_full %>% filter(user_id == "280" & rating > 3)
+knitr::kable(random_id %>% select(tag, title, avgRating, rating))
+#вывод: По полученным оценкам пользователю необходимо рекомендовать фильмы со средним рейтингом на MovieLens (от 3.7 до 4.5). Судя по тегам, пользователю нравятся фильмы про преступления, месть, философию и фильмы, отмеченные тегом депрессивный. Теперь оценим фильмы, которые порекомендует данному пользовтелю получившаяся рекомендательная система.
+
+cf_recommendation(280)
+#посмотрим характеристики данных фильмов
+avRating = ratings %>% group_by(item_id) %>% summarise(mean_rating = mean(rating))
+avRating_films =films_full %>% inner_join(avRating)
+rec_random = avRating_films %>% filter(title == c("Zombieland (2009)", "Kalifornia (1993)", "Jurassic Park (1993)", "Toy Story (1995)", "Seven (a.k.a. Se7en) (1995)","Memento (2000)")) 
+rec_random = rec_random %>% inner_join(films_full) 
+rec_random = rec_random %>% group_by(tag,title, avgRating, mean_rating ) %>% summarise(n = n())
+knitr::kable(rec_random%>% select(tag, title, avgRating, mean_rating))
+#Про полученные фильмы можно сказать, что их средняя оценка на MovieLens и средняя пользовательская оценка средняя, то есть от 3.7 до 4.5. По тегам можно увидеть, что там есть психология, преступления, жестокость и черная комедия. В данном случае по тегам не совпадают фильмы "Toy Story (1995)" и "  Jurassic Park (1993)", однако они подходят по средней оценке. Можно сказать, что из 6 фильмов 4 близки к предпочтениям пользователя.
+
+```
+
+
+##### Примеры content-based
+Если пользователю понравились фильмы с тегами "entertaining", 'children' и 'classic', то какой фильм будет порекомендован?
+```{r message=FALSE, warning=FALSE}
+films_by_tags = inner_join(tags_full, metadata) %>% 
+  select(c("tag", "mean_confident", "title", "avgRating"))
+
+#посмотрим на среднюю оценку пользователей и объединим с датасетом
+films_by_rating = ratings%>% group_by(user_id)
+films_full = films_by_tags %>% inner_join(films_by_rating)
+seventh = films_full %>% group_by(tag) %>% filter(tag == "classic" | tag == "children" | tag == "entertaining") #отбираем только фильмы с этими тегами
+seventh %>% group_by(user_id) %>% summarise(n = n()) %>% arrange(-n) #выбираем пользователя, который поставил как можно больше оценок с такими тегами
+recommendations(171203)
+avRating = ratings %>% group_by(item_id) %>% summarise(mean_rating = mean(rating))
+avRating_films =films_full %>% inner_join(avRating)
+rec_random = avRating_films %>% filter(title == c("Monsters, Inc. (2001)", "Jurassic Park III (2001)", "Men in Black II (a.k.a. MIIB) (a.k.a. MIB 2) (2002)", "Mission to Mars (2000)", "Time Machine, The (2002)"))
+rec_random = rec_random %>% inner_join(films_full) 
+rec_random = rec_random %>% group_by(tag,title, avgRating, mean_rating ) %>% summarise(n = n())
+knitr::kable(rec_random%>% select(tag, title, avgRating, mean_rating))
+```
+**Вывод**: по тегам один из предложенных фильмов был с тегом "children", что совпадает с запросом пользователя. однако, посмотрев описание всех предложенных фильмов, можно сказать, что предложены соответствующие вкусам пользователя фильмы.
+
+### Выводы
+
+Для ответов на большинство вопросов из peer_review следует создать новые рекомендательные системы, где будут вводиться топики из LDA или имена режиссеров. Однако, пока что возникли трудности с написанием функции. На остальные замечания мы смогли ответить и смогли исправить многие недочеты. 
+
+### Ответы на вопросы peer review
+
+**Вопрос:** Не совсем понятно из презентации, как используется метод коллаборативной фильтрации для рекомендации рандомного пользования, в целом, код логичный, но как раз, как не имея никакой информации  о человеке и не запрашивая её  можно использовать
+
+*Ответ:* Без информации о пользователе или его предпочтениях нет способа определить, каких пользователей считать похожими или какие элементы рекомендовать. Поэтому, без какой-либо информации, коллаборативная фильтрация не может быть применена эффективно. Для нового пользователя рекомендуется топ из 10 фильмов с высокими оценками.
+
+**Вопрос:**  Непонятно, как используется сетевой анализ и используется ли вообще. 
+
+*Ответ:* Нет, сетевой анализ не используется. В своей работе мы ограничились текстовым анализом.
+
+**Вопрос:** Я так и не поняла, что принимает на вход функция с content-based рекомендательной системы?
+
+*Ответ:* Вводится id пользователя
+
+**Вопрос:** Можно добавить оценку, где показывается, что IBCF лучше чем UBCF(даже используя MSE, MAE).
+
+*Ответ:* Оценка была проведена. Действительно, IBCF рекомендации лучше, так как показатели MSE, MAE, RMSE ниже, чем для UBCF.
+
